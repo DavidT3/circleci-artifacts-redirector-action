@@ -44016,13 +44016,36 @@ async function run() {
     const payload = github_context.payload
     const path = getInput('artifact-path', {required: true})
     const token = getInput('repo-token', {required: true})
-    var apiToken = getInput('api-token', {required: false})
-    if (apiToken == null || apiToken == '') {
-      apiToken = 'null'
-    } else {
-      core_debug(`Successfully read CircleCI API token`)
+    const apiToken = getInput('api-token', {required: false})
+    const headers = {
+      'accept': 'application/json',
+      'user-agent': 'curl/7.85.0'
     }
-    const headers = {'Circle-Token': apiToken, 'accept': 'application/json', 'user-agent': 'curl/7.85.0'}
+    if (apiToken && apiToken !== '' && apiToken !== 'null') {
+      headers['Circle-Token'] = apiToken
+      core_debug(`CircleCI API token provided`)
+    }
+
+    /**
+     * Helper to fetch from CircleCI API with automatic token fallback for public repos
+     */
+    const fetchCircleCI = async (url) => {
+      let res = await fetch(url, {headers});
+      let data = await res.json();
+
+      if (data.message === 'Invalid token provided.' && headers['Circle-Token']) {
+        core_debug(`Token rejected for ${url}, attempting unauthenticated request...`);
+        // Permanently remove the token from future requests in this run
+        delete headers['Circle-Token'];
+        res = await fetch(url, {headers});
+        data = await res.json();
+      }
+
+      if (data.message) {
+        throw new Error(`CircleCI API error: ${data.message}`);
+      }
+      return data;
+    };
 
     var circleciJobs = getInput('circleci-jobs', {required: false})
     if (circleciJobs === '') {
@@ -44052,8 +44075,8 @@ async function run() {
     // e.g., https://circleci.com/gh/scientific-python/circleci-artifacts-redirector-action/94?utm_campaign=vcs-integration-link&utm_medium=referral&utm_source=github-build-link
     // Set the new status
     let artifacts_url = '';
-    const target = payload.target_url.split('?')[0];   // strip any ?utm=…
-    if (target.includes('/pipelines/circleci/') || target.includes('app.circleci.com/workflow/')) {
+    const target = payload.target_url.split('?')[0].replace(/\/$/, '');   // strip any ?utm=… and trailing slashes
+    if (target.includes('app.circleci.com') || target.includes('/pipelines/circleci/')) {
       // ───── New GitHub‑App URL ───────────────────────────────────────────
       // .../pipelines/circleci/<org‑id>/<project‑id>/<pipe‑seq>/workflows/<workflow‑id>
       // OR
@@ -44067,13 +44090,7 @@ async function run() {
         const jobId = target.split('/').pop();
         core_debug(`Job ID detected: ${jobId}`);
 
-        const jobRes = await fetch(`https://circleci.com/api/v2/jobs/${jobId}`, {headers});
-        const job = await jobRes.json();
-
-        if (job.message) {
-          setFailed(`CircleCI API error: ${job.message}`);
-          return;
-        }
+        const job = await fetchCircleCI(`https://circleci.com/api/v2/jobs/${jobId}`);
 
         projectSlug = job.project.slug;
         jobNumber = job.number;
@@ -44082,11 +44099,8 @@ async function run() {
         core_debug(`Workflow ID detected: ${workflowId}`);
 
         // 1. Get the jobs that belong to this workflow
-        const jobsRes = await fetch(
-          `https://circleci.com/api/v2/workflow/${workflowId}/job`,
-          {headers}
-        );
-        const jobs = await jobsRes.json();
+        const jobs = await fetchCircleCI(`https://circleci.com/api/v2/workflow/${workflowId}/job`);
+
         if (!jobs.items || !jobs.items.length) {
           setFailed(`No jobs returned for workflow ${workflowId}`);
           return;
@@ -44140,13 +44154,13 @@ async function run() {
     }
     core_debug(`Fetching JSON: ${artifacts_url}`)
     // e.g., https://circleci.com/api/v2/project/gh/scientific-python/circleci-artifacts-redirector-action/94/artifacts
-    const response = await fetch(artifacts_url, {headers})
-    const artifacts = await response.json()
-    core_debug(`Artifacts JSON (status=${response.status}):`)
+    const artifacts = await fetchCircleCI(artifacts_url);
+
+    core_debug(`Artifacts JSON:`)
     core_debug(JSON.stringify(artifacts))
     // e.g., {"next_page_token":null,"items":[{"path":"test_artifacts/root_artifact.md","node_index":0,"url":"https://output.circle-artifacts.com/output/job/6fdfd148-31da-4a30-8e89-a20595696ca5/artifacts/0/test_artifacts/root_artifact.md"}]}
     var url = '';
-    if (artifacts.items.length > 0) {
+    if (artifacts.items && artifacts.items.length > 0) {
       url = `${artifacts.items[0].url.split('/artifacts/')[0]}/artifacts/${path}`
     }
     else {
