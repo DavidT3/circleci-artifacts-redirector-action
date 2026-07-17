@@ -75,6 +75,7 @@ async function run() {
     // e.g., https://circleci.com/gh/mne-tools/mne-python/53315
     // e.g., https://circleci.com/gh/scientific-python/circleci-artifacts-redirector-action/94?utm_campaign=vcs-integration-link&utm_medium=referral&utm_source=github-build-link
     // Set the new status
+    let url = '';
     let artifacts_url = '';
     const target = payload.target_url.split('?')[0].replace(/\/$/, '');   // strip any ?utm=… and trailing slashes
     if (target.includes('app.circleci.com') || target.includes('/pipelines/circleci/')) {
@@ -85,18 +86,19 @@ async function run() {
       // OR
       // .../workflow/<workflow-id>/job/<job-id>
 
-      let projectSlug, jobNumber;
+      const parts = target.split('/');
+      const jIdx = parts.findIndex(p => p === 'job');
+      const wIdx = parts.findIndex(p => p.startsWith('workflow'));
 
-      if (target.includes('/job/')) {
-        const jobId = target.split('/').pop();
+      if (jIdx !== -1 && parts.length > jIdx + 1) {
+        // If we have a Job ID (UUID) in the URL, we can construct the artifact URL directly
+        // and avoid calling the restricted /jobs/{id} API endpoint.
+        const jobId = parts[jIdx + 1];
         core.debug(`Job ID detected: ${jobId}`);
-
-        const job = await fetchCircleCI(`https://circleci.com/api/v2/jobs/${jobId}`);
-
-        projectSlug = job.project.slug;
-        jobNumber = job.number;
+        url = `https://output.circle-artifacts.com/output/job/${jobId}/artifacts/${path}`;
+        core.debug(`Constructed artifact URL directly from Job ID: ${url}`);
       } else {
-        const workflowId = target.split('/').pop();
+        const workflowId = (wIdx !== -1 && parts.length > wIdx + 1) ? parts[wIdx + 1] : parts.pop();
         core.debug(`Workflow ID detected: ${workflowId}`);
 
         // 1. Get the jobs that belong to this workflow
@@ -108,41 +110,38 @@ async function run() {
         }
 
         // 2. Identify and select the relevant job
-        // The simplest case is when a workflow contains only a single job, just
-        //  select the first entry
         let selectedJob = null;
-        if (jobs.items.length === 1) {
-          selectedJob = jobs.items[0];
-          core.debug("Workflow contains one job.");
-        }
         // If there are multiple jobs in the workflow, select the first one that
-        //  matches one of the job names passed to the action.
-        else {
-          for (const jobItem of jobs.items) {
-            core.debug(`Checking job: ${jobItem.name} against ${circleciJobNames.join(',')}`);
-            if (circleciJobNames.includes(jobItem.name)) {
-              selectedJob = jobItem;
-              break;
-            }
+        // matches one of the job names passed to the action.
+        for (const jobItem of jobs.items) {
+          core.debug(`Checking job: ${jobItem.name} against ${circleciJobNames.join(',')}`);
+          if (circleciJobNames.includes(jobItem.name)) {
+            selectedJob = jobItem;
+            break;
           }
+        }
 
-          // In the case where no matching job is found, use the first job
-          if (selectedJob == null) {
-            selectedJob = jobs.items[0];
+        // In the case where no matching job is found, or there's only one job,
+        // fall back to the first job in the list.
+        if (selectedJob == null) {
+          selectedJob = jobs.items[0];
+          if (jobs.items.length > 1) {
             core.debug(`No matching job found for ${circleciJobNames.join(', ')}. Using first job: ${selectedJob.name}`);
+          } else {
+            core.debug("Workflow contains only one job.");
           }
         }
 
         // Extract the project slug and job number from the selected job
-        projectSlug = selectedJob.project_slug;  // "circleci/<org‑id>/<project‑id>"
-        jobNumber   = selectedJob.job_number;
+        const projectSlug = selectedJob.project_slug;  // "circleci/<org‑id>/<project‑id>"
+        const jobNumber   = selectedJob.job_number;
+
+        core.debug(`slug:  ${projectSlug}`);
+        core.debug(`job#:  ${jobNumber}`);
+
+        // 3. Construct the v2 artifacts endpoint
+        artifacts_url = `https://circleci.com/api/v2/project/${projectSlug}/${jobNumber}/artifacts`;
       }
-
-      core.debug(`slug:  ${projectSlug}`);
-      core.debug(`job#:  ${jobNumber}`);
-
-      // 3. Construct the v2 artifacts endpoint
-      artifacts_url = `https://circleci.com/api/v2/project/${projectSlug}/${jobNumber}/artifacts`;
     } else {
       // ───── Legacy OAuth URL (…/gh/<org>/<repo>/<build>) ────────────────
       const parts    = target.split('/');
@@ -153,19 +152,20 @@ async function run() {
       artifacts_url =
         `https://circleci.com/api/v2/project/gh/${orgId}/${repoId}/${buildId}/artifacts`;
     }
-    core.debug(`Fetching JSON: ${artifacts_url}`)
-    // e.g., https://circleci.com/api/v2/project/gh/scientific-python/circleci-artifacts-redirector-action/94/artifacts
-    const artifacts = await fetchCircleCI(artifacts_url);
+    if (url === '') {
+      core.debug(`Fetching JSON: ${artifacts_url}`)
+      // e.g., https://circleci.com/api/v2/project/gh/scientific-python/circleci-artifacts-redirector-action/94/artifacts
+      const artifacts = await fetchCircleCI(artifacts_url);
 
-    core.debug(`Artifacts JSON:`)
-    core.debug(JSON.stringify(artifacts))
-    // e.g., {"next_page_token":null,"items":[{"path":"test_artifacts/root_artifact.md","node_index":0,"url":"https://output.circle-artifacts.com/output/job/6fdfd148-31da-4a30-8e89-a20595696ca5/artifacts/0/test_artifacts/root_artifact.md"}]}
-    var url = '';
-    if (artifacts.items && artifacts.items.length > 0) {
-      url = `${artifacts.items[0].url.split('/artifacts/')[0]}/artifacts/${path}`
-    }
-    else {
-      url = payload.target_url;
+      core.debug(`Artifacts JSON:`)
+      core.debug(JSON.stringify(artifacts))
+      // e.g., {"next_page_token":null,"items":[{"path":"test_artifacts/root_artifact.md","node_index":0,"url":"https://output.circle-artifacts.com/output/job/6fdfd148-31da-4a30-8e89-a20595696ca5/artifacts/0/test_artifacts/root_artifact.md"}]}
+      if (artifacts.items && artifacts.items.length > 0) {
+        url = `${artifacts.items[0].url.split('/artifacts/')[0]}/artifacts/${path}`
+      }
+      else {
+        url = payload.target_url;
+      }
     }
     // Set root domain
     var domain = core.getInput('domain')
