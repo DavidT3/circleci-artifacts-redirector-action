@@ -44017,6 +44017,13 @@ async function run() {
     const path = getInput('artifact-path', {required: true})
     const token = getInput('repo-token', {required: true})
     var apiToken = getInput('api-token', {required: false})
+    if (apiToken == null || apiToken == '') {
+      apiToken = 'null'
+    } else {
+      core_debug(`Successfully read CircleCI API token`)
+    }
+    const headers = {'Circle-Token': apiToken, 'accept': 'application/json', 'user-agent': 'curl/7.85.0'}
+
     var circleciJobs = getInput('circleci-jobs', {required: false})
     if (circleciJobs === '') {
       circleciJobs = 'build_docs,doc,build'
@@ -44051,48 +44058,70 @@ async function run() {
       // .../pipelines/circleci/<org‑id>/<project‑id>/<pipe‑seq>/workflows/<workflow‑id>
       // OR
       // .../workflow/<workflow-id>
-      const workflowId = target.split('/').pop();
-      core_debug(`workflow: ${workflowId}`);
+      // OR
+      // .../workflow/<workflow-id>/job/<job-id>
 
-      // 1. Get the jobs that belong to this workflow
-      const jobsRes = await fetch(
-        `https://circleci.com/api/v2/workflow/${workflowId}/job`
-      );
-      const jobs = await jobsRes.json();
-      if (!jobs.items.length) {
-        setFailed(`No jobs returned for workflow ${workflowId}`);
-        return;
-      }
+      let projectSlug, jobNumber;
 
-      // 2. Identify and select the relevant job
-      // The simplest case is when a workflow contains only a single job, just
-      //  select the first entry
-      let job = null;
-      if (jobs.items.length === 1) {
-        job = jobs.items[0];
-        core_debug("Workflow contains one job.");
-      }
-      // If there are multiple jobs in the workflow, select the first one that
-      //  matches one of the job names passed to the action.
-      else {
-        for (const jobItem of jobs.items) {
-          core_debug(`Checking job: ${jobItem.name} against ${circleciJobNames.join(',')}`);
-          if (circleciJobNames.includes(jobItem.name)) {
-            job = jobItem;
-            break;
+      if (target.includes('/job/')) {
+        const jobId = target.split('/').pop();
+        core_debug(`Job ID detected: ${jobId}`);
+
+        const jobRes = await fetch(`https://circleci.com/api/v2/jobs/${jobId}`, {headers});
+        const job = await jobRes.json();
+
+        if (job.message) {
+          setFailed(`CircleCI API error: ${job.message}`);
+          return;
+        }
+
+        projectSlug = job.project.slug;
+        jobNumber = job.number;
+      } else {
+        const workflowId = target.split('/').pop();
+        core_debug(`Workflow ID detected: ${workflowId}`);
+
+        // 1. Get the jobs that belong to this workflow
+        const jobsRes = await fetch(
+          `https://circleci.com/api/v2/workflow/${workflowId}/job`,
+          {headers}
+        );
+        const jobs = await jobsRes.json();
+        if (!jobs.items || !jobs.items.length) {
+          setFailed(`No jobs returned for workflow ${workflowId}`);
+          return;
+        }
+
+        // 2. Identify and select the relevant job
+        // The simplest case is when a workflow contains only a single job, just
+        //  select the first entry
+        let selectedJob = null;
+        if (jobs.items.length === 1) {
+          selectedJob = jobs.items[0];
+          core_debug("Workflow contains one job.");
+        }
+        // If there are multiple jobs in the workflow, select the first one that
+        //  matches one of the job names passed to the action.
+        else {
+          for (const jobItem of jobs.items) {
+            core_debug(`Checking job: ${jobItem.name} against ${circleciJobNames.join(',')}`);
+            if (circleciJobNames.includes(jobItem.name)) {
+              selectedJob = jobItem;
+              break;
+            }
+          }
+
+          // In the case where no matching job is found, use the first job
+          if (selectedJob == null) {
+            selectedJob = jobs.items[0];
+            core_debug(`No matching job found for ${circleciJobNames.join(', ')}. Using first job: ${selectedJob.name}`);
           }
         }
 
-        // In the case where no matching job is found, use the first job
-        if (job == null) {
-          job = jobs.items[0];
-          core_debug(`No matching job found for ${circleciJobNames.join(', ')}. Using first job: ${job.name}`);
-        }
+        // Extract the project slug and job number from the selected job
+        projectSlug = selectedJob.project_slug;  // "circleci/<org‑id>/<project‑id>"
+        jobNumber   = selectedJob.job_number;
       }
-
-      // Extract the project slug and job number from the selected job
-      const projectSlug = job.project_slug;  // "circleci/<org‑id>/<project‑id>"
-      const jobNumber   = job.job_number;
 
       core_debug(`slug:  ${projectSlug}`);
       core_debug(`job#:  ${jobNumber}`);
@@ -44110,13 +44139,6 @@ async function run() {
         `https://circleci.com/api/v2/project/gh/${orgId}/${repoId}/${buildId}/artifacts`;
     }
     core_debug(`Fetching JSON: ${artifacts_url}`)
-    if (apiToken == null || apiToken == '') {
-      apiToken = 'null'
-    }
-    else {
-      core_debug(`Successfully read CircleCI API token ${apiToken}`)
-    }
-    const headers = {'Circle-Token': apiToken, 'accept': 'application/json', 'user-agent': 'curl/7.85.0'}
     // e.g., https://circleci.com/api/v2/project/gh/scientific-python/circleci-artifacts-redirector-action/94/artifacts
     const response = await fetch(artifacts_url, {headers})
     const artifacts = await response.json()
